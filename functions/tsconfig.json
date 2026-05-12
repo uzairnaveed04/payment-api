@@ -1,0 +1,1 @@
+﻿{"compilerOptions":{"module":"commonjs","noImplicitReturns":true,"noUnusedLocals":true,"outDir":"lib","rootDir":"src","sourceMap":true,"strict":true,"target":"es2020","moduleResolution":"node","esModuleInterop":true,"skipLibCheck":true},"compileOnSave":true,"include":["src"]}
