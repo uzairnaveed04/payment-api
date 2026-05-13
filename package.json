@@ -5,7 +5,8 @@
   "description": "Standalone Express payment API (Razorpay + Firebase Admin) for Railway/Render",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:razorpay": "node scripts/verify-razorpay.js"
   },
   "engines": {
     "node": ">=18"
@@ -14,7 +15,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
-    "firebase-admin": "^13.0.2",
+    "firebase-admin": "^13.9.0",
     "razorpay": "^2.9.6"
   }
 }

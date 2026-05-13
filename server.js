@@ -1,322 +1,338 @@
-/**
- * Standalone payment API for Railway / Render.
- * Replaces Firebase callable functions: createRazorpayOrder, verifyRazorpayPayment.
- */
+require("dotenv").config();
 
-require('dotenv').config();
+const fs = require("fs");
+const path = require("path");
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const Razorpay = require("razorpay");
+const admin = require("firebase-admin");
 
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const Razorpay = require('razorpay');
-const admin = require('firebase-admin');
+// -------------------- CONFIG --------------------
 
 const VALID_PLANS = {
-  weekly: { durationDays: 7, amount: 2.99, currency: 'GBP' },
-  monthly: { durationDays: 30, amount: 8.99, currency: 'GBP' },
+  weekly: { durationDays: 7, amount: 2.99, currency: "GBP" },
+  monthly: { durationDays: 30, amount: 8.99, currency: "GBP" },
 };
+
+// -------------------- FIREBASE ADMIN --------------------
+
+/**
+ * Initialize Firebase Admin once. Does not throw — returns false if credentials missing/invalid.
+ * Railway: set FIREBASE_SERVICE_ACCOUNT_JSON (single-line JSON).
+ * Local dev: same, OR download service account JSON and set GOOGLE_APPLICATION_CREDENTIALS to the file path.
+ */
+function initFirebaseAdmin() {
+  if (admin.apps.length > 0) return true;
+
+  const rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  if (rawEnv) {
+    try {
+      const serviceAccount = JSON.parse(rawEnv);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+      return true;
+    } catch (e) {
+      console.error(
+        "[payment-api] FIREBASE_SERVICE_ACCOUNT_JSON is invalid JSON:",
+        e.message
+      );
+      return false;
+    }
+  }
+
+  const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+  if (credPath) {
+    try {
+      const resolved = path.isAbsolute(credPath)
+        ? credPath
+        : path.resolve(process.cwd(), credPath);
+      if (!fs.existsSync(resolved)) {
+        console.error(
+          "[payment-api] GOOGLE_APPLICATION_CREDENTIALS file not found:",
+          resolved
+        );
+        return false;
+      }
+      const serviceAccount = JSON.parse(fs.readFileSync(resolved, "utf8"));
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+      return true;
+    } catch (e) {
+      console.error(
+        "[payment-api] Failed to load GOOGLE_APPLICATION_CREDENTIALS:",
+        e.message
+      );
+      return false;
+    }
+  }
+
+  return false;
+}
+
+function ensureFirebaseAdmin(req, res, next) {
+  if (!initFirebaseAdmin()) {
+    return res.status(503).json({
+      success: false,
+      error:
+        "Firebase Admin not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON (Railway) or GOOGLE_APPLICATION_CREDENTIALS path to your service account JSON file (.env). See .env.example.",
+    });
+  }
+  next();
+}
+
+// -------------------- EXPRESS --------------------
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json({ limit: "256kb" }));
+
+// -------------------- RAZORPAY --------------------
 
 const getRazorpayCredentials = () => {
   const keyId = process.env.RAZORPAY_KEY_ID?.trim();
   const secret =
-    process.env.RAZORPAY_SECRET?.trim() || process.env.RAZORPAY_KEY_SECRET?.trim();
+    process.env.RAZORPAY_SECRET?.trim() ||
+    process.env.RAZORPAY_KEY_SECRET?.trim();
+
   if (!keyId || !secret) return null;
   return { keyId, secret };
 };
 
+// -------------------- HELPERS --------------------
+
 function validatePaymentRequest(authUid, userId, planType, amount) {
   if (!authUid || authUid !== userId) {
-    const e = new Error('Authentication required. Please login before purchasing.');
-    e.code = 'unauthenticated';
-    throw e;
+    throw { code: "unauthenticated", message: "Login required" };
   }
 
-  if (typeof planType !== 'string' || !VALID_PLANS[planType]) {
-    const e = new Error("Invalid plan type. Only 'weekly' and 'monthly' are allowed.");
-    e.code = 'invalid-argument';
-    throw e;
+  if (!VALID_PLANS[planType]) {
+    throw { code: "invalid-argument", message: "Invalid plan type" };
   }
 
-  const planConfig = VALID_PLANS[planType];
+  const plan = VALID_PLANS[planType];
   const numAmount = Number(amount);
-  if (!Number.isFinite(numAmount) || numAmount !== planConfig.amount) {
-    const e = new Error(`Invalid amount for ${planType} plan.`);
-    e.code = 'invalid-argument';
-    throw e;
+
+  if (numAmount !== plan.amount) {
+    throw { code: "invalid-argument", message: "Invalid amount" };
   }
 
-  return { planType, planConfig, numAmount };
+  return { plan, numAmount };
 }
 
-function httpStatusForCode(code) {
-  switch (code) {
-    case 'unauthenticated':
-      return 401;
-    case 'invalid-argument':
-      return 400;
-    case 'permission-denied':
-      return 403;
-    case 'already-exists':
-      return 409;
-    default:
-      return 500;
-  }
-}
+function sendError(res, err) {
+  const status =
+    err.code === "unauthenticated"
+      ? 401
+      : err.code === "invalid-argument"
+      ? 400
+      : err.code === "already-exists"
+      ? 409
+      : err.code === "failed-precondition"
+      ? 503
+      : 500;
 
-function sendError(res, code, message) {
-  const status = httpStatusForCode(code);
-  res.status(status).json({ error: { code, message } });
-}
-
-const DOMAIN_ERROR_CODES = new Set([
-  'unauthenticated',
-  'invalid-argument',
-  'permission-denied',
-  'already-exists',
-]);
-
-function isDomainError(err) {
-  return err && DOMAIN_ERROR_CODES.has(err.code);
-}
-
-function initFirebaseAdmin() {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
-  if (!raw) {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is required');
-  }
-  const credentials = JSON.parse(raw);
-  admin.initializeApp({
-    credential: admin.credential.cert(credentials),
+  return res.status(status).json({
+    success: false,
+    error: err.message || "Server error",
   });
 }
 
-function parseCorsOrigins() {
-  const raw = process.env.CORS_ORIGINS?.trim();
-  if (!raw) return true;
-  return raw.split(',').map((s) => s.trim()).filter(Boolean);
-}
+// -------------------- AUTH --------------------
 
 async function authenticateFirebase(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
-  if (!token) {
-    return sendError(res, 'unauthenticated', 'Missing Authorization Bearer token');
-  }
   try {
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ")
+      ? header.split("Bearer ")[1]
+      : null;
+
+    if (!token) {
+      return sendError(res, {
+        code: "unauthenticated",
+        message: "Missing token",
+      });
+    }
+
     const decoded = await admin.auth().verifyIdToken(token);
     req.authUid = decoded.uid;
+
     next();
   } catch (err) {
-    console.warn('verifyIdToken failed', err.message);
-    return sendError(res, 'unauthenticated', 'Invalid or expired token');
+    return sendError(res, {
+      code: "unauthenticated",
+      message: "Invalid token",
+    });
   }
 }
 
-initFirebaseAdmin();
+// -------------------- ROUTES --------------------
 
-const app = express();
-const PORT = Number(process.env.PORT) || 3000;
-
-app.use(
-  cors({
-    origin: parseCorsOrigins(),
-    credentials: true,
-  })
-);
-app.use(express.json({ limit: '256kb' }));
-
-app.get('/health', (_req, res) => {
+app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-/**
- * POST /api/payments/create-order
- * Body: { userId, planType: 'weekly' | 'monthly', amount }
- */
-app.post('/api/payments/create-order', authenticateFirebase, async (req, res) => {
-  try {
-    const { userId, planType, amount } = req.body || {};
-    const { planConfig, numAmount } = validatePaymentRequest(
-      req.authUid,
-      userId,
-      planType,
-      amount
-    );
+// CREATE ORDER
+app.post(
+  "/api/payments/create-order",
+  ensureFirebaseAdmin,
+  authenticateFirebase,
+  async (req, res) => {
+    try {
+      const { userId, planType, amount } = req.body;
 
-    const creds = getRazorpayCredentials();
-    if (!creds) {
-      console.error('Razorpay credentials missing (RAZORPAY_KEY_ID + RAZORPAY_SECRET)');
-      return sendError(res, 'internal', 'Server configuration error. Please contact support.');
-    }
-
-    const razorpay = new Razorpay({
-      key_id: creds.keyId,
-      key_secret: creds.secret,
-    });
-
-    const order = await razorpay.orders.create({
-      amount: Math.round(numAmount * 100),
-      currency: planConfig.currency,
-      receipt: `${userId}_${planType}_${Date.now()}`,
-      notes: { userId, planType },
-    });
-
-    if (!order?.id || order.amount == null || !order.currency) {
-      console.error('Razorpay order creation returned unexpected payload', order);
-      return sendError(res, 'internal', 'Could not create payment order. Please try again.');
-    }
-
-    return res.json({
-      success: true,
-      orderId: order.id,
-      amount: order.amount,
-      currency: order.currency,
-    });
-  } catch (err) {
-    if (isDomainError(err)) {
-      return sendError(res, err.code, err.message);
-    }
-    console.error('Create Razorpay order error:', err.message || err);
-    return sendError(res, 'internal', 'Could not create payment order. Please try again.');
-  }
-});
-
-/**
- * POST /api/payments/verify
- * Body: { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, planType, amount }
- */
-app.post('/api/payments/verify', authenticateFirebase, async (req, res) => {
-  try {
-    const data = req.body || {};
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      userId,
-      planType,
-      amount,
-    } = data;
-
-    if (
-      !razorpay_order_id ||
-      !razorpay_payment_id ||
-      !razorpay_signature ||
-      !userId ||
-      !planType ||
-      amount === undefined
-    ) {
-      return sendError(res, 'invalid-argument', 'Missing required payment parameters.');
-    }
-
-    if (
-      typeof razorpay_order_id !== 'string' ||
-      typeof razorpay_payment_id !== 'string' ||
-      typeof razorpay_signature !== 'string'
-    ) {
-      return sendError(res, 'invalid-argument', 'Invalid parameter types.');
-    }
-
-    if (
-      !razorpay_order_id.trim() ||
-      !razorpay_payment_id.trim() ||
-      !razorpay_signature.trim()
-    ) {
-      return sendError(res, 'invalid-argument', 'Payment parameters cannot be empty.');
-    }
-
-    const { planConfig, numAmount } = validatePaymentRequest(
-      req.authUid,
-      userId,
-      planType,
-      amount
-    );
-
-    const db = admin.firestore();
-    const existingPayment = await db
-      .collection('subscriptions')
-      .where('paymentId', '==', razorpay_payment_id)
-      .limit(1)
-      .get();
-
-    if (!existingPayment.empty) {
-      console.warn('Duplicate payment attempt', { paymentId: razorpay_payment_id, userId });
-      return sendError(res, 'already-exists', 'This payment has already been processed.');
-    }
-
-    const creds = getRazorpayCredentials();
-    if (!creds) {
-      console.error('Razorpay credentials missing for verification');
-      return sendError(res, 'internal', 'Server configuration error. Please contact support.');
-    }
-
-    const text = razorpay_order_id + '|' + razorpay_payment_id;
-    const expectedSignature = crypto
-      .createHmac('sha256', creds.secret)
-      .update(text)
-      .digest('hex');
-
-    const expectedBuffer = Buffer.from(expectedSignature, 'hex');
-    const providedBuffer = Buffer.from(razorpay_signature, 'hex');
-    const signatureMatches =
-      expectedBuffer.length === providedBuffer.length &&
-      crypto.timingSafeEqual(expectedBuffer, providedBuffer);
-
-    if (!signatureMatches) {
-      console.warn('Invalid Razorpay signature', { paymentId: razorpay_payment_id, userId });
-      return sendError(
-        res,
-        'permission-denied',
-        'Payment signature verification failed. This payment cannot be processed.'
+      const { plan, numAmount } = validatePaymentRequest(
+        req.authUid,
+        userId,
+        planType,
+        amount
       );
+
+      const creds = getRazorpayCredentials();
+
+      if (!creds) {
+        throw {
+          code: "internal",
+          message: "Missing Razorpay credentials",
+        };
+      }
+
+      const razorpay = new Razorpay({
+        key_id: creds.keyId,
+        key_secret: creds.secret,
+      });
+
+      const order = await razorpay.orders.create({
+        amount: Math.round(numAmount * 100),
+        currency: plan.currency,
+        receipt: `${userId}_${planType}_${Date.now()}`,
+        notes: { userId, planType },
+      });
+
+      res.json({
+        success: true,
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
+      });
+    } catch (err) {
+      return sendError(res, err);
     }
+  }
+);
 
-    const now = Date.now();
-    const expiryDate = now + planConfig.durationDays * 24 * 60 * 60 * 1000;
+// VERIFY PAYMENT
+app.post(
+  "/api/payments/verify",
+  ensureFirebaseAdmin,
+  authenticateFirebase,
+  async (req, res) => {
+    try {
+      const {
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+        userId,
+        planType,
+        amount,
+      } = req.body;
 
-    const subscriptionData = {
-      userId,
-      paymentId: razorpay_payment_id,
-      orderId: razorpay_order_id,
-      verified: true,
-      status: 'active',
-      planType,
-      amount: numAmount,
-      createdAt: now,
-      expiryDate,
-      platform: 'razorpay',
-    };
+      if (
+        !razorpay_order_id ||
+        !razorpay_payment_id ||
+        !razorpay_signature
+      ) {
+        throw {
+          code: "invalid-argument",
+          message: "Missing payment data",
+        };
+      }
 
-    const docRef = await db.collection('subscriptions').add(subscriptionData);
+      const { plan, numAmount } = validatePaymentRequest(
+        req.authUid,
+        userId,
+        planType,
+        amount
+      );
 
-    console.info('Subscription created', {
-      subscriptionId: docRef.id,
-      userId,
-      planType,
-      expiryDate,
-    });
+      const db = admin.firestore();
 
-    return res.json({
-      success: true,
-      subscriptionId: docRef.id,
-      message: 'Subscription activated successfully. Premium access is now active.',
-    });
-  } catch (err) {
-    if (isDomainError(err)) {
-      return sendError(res, err.code, err.message);
+      const existing = await db
+        .collection("subscriptions")
+        .where("paymentId", "==", razorpay_payment_id)
+        .limit(1)
+        .get();
+
+      if (!existing.empty) {
+        throw {
+          code: "already-exists",
+          message: "Payment already processed",
+        };
+      }
+
+      const creds = getRazorpayCredentials();
+      if (!creds) {
+        throw {
+          code: "internal",
+          message: "Missing Razorpay credentials",
+        };
+      }
+
+      const signature = crypto
+        .createHmac("sha256", creds.secret)
+        .update(razorpay_order_id + "|" + razorpay_payment_id)
+        .digest("hex");
+
+      if (signature !== razorpay_signature) {
+        throw {
+          code: "invalid-argument",
+          message: "Invalid signature",
+        };
+      }
+
+      const now = Date.now();
+      const expiry = now + plan.durationDays * 86400000;
+
+      const doc = await db.collection("subscriptions").add({
+        userId,
+        paymentId: razorpay_payment_id,
+        orderId: razorpay_order_id,
+        planType,
+        amount: numAmount,
+        status: "active",
+        verified: true,
+        platform: "razorpay",
+        createdAt: now,
+        expiryDate: expiry,
+      });
+
+      res.json({
+        success: true,
+        subscriptionId: doc.id,
+      });
+    } catch (err) {
+      return sendError(res, err);
     }
-    console.error('Payment verification error:', err.message || err);
-    return sendError(
-      res,
-      'internal',
-      'Payment verification failed. Please try again or contact support.'
+  }
+);
+
+// -------------------- 404 --------------------
+
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
+});
+
+// -------------------- START --------------------
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Server running on port", PORT);
+  if (!initFirebaseAdmin()) {
+    console.warn(
+      "[payment-api] Firebase Admin not configured — /health still works; payment routes return 503 until you set FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS."
     );
   }
-});
-
-app.use((_req, res) => {
-  res.status(404).json({ error: { code: 'not-found', message: 'Route not found' } });
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Payment API listening on port ${PORT}`);
 });

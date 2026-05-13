@@ -5,3 +5,7 @@ node_modules/
 *.log
 .DS_Store
 .next/
+*-firebase-adminsdk-*.json
+*-adminsdk-*.json
+firebase-adminsdk*.json
+razorpay_selftest_result.txt
