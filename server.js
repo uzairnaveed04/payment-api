@@ -255,6 +255,12 @@ const getRazorpayCredentials = () => {
   return { keyId, secret };
 };
 
+/** Razorpay receipt max length is 40 — Firebase uid + plan + timestamp exceeds that. */
+function razorpayReceipt(userId, planType) {
+  const raw = `${userId}|${planType}|${Date.now()}|${crypto.randomBytes(8).toString("hex")}`;
+  return crypto.createHash("sha256").update(raw).digest("hex").slice(0, 40);
+}
+
 // -------------------- HELPERS --------------------
 
 /**
@@ -607,7 +613,7 @@ app.post(
       const order = await razorpay.orders.create({
         amount: amountMinor,
         currency: plan.currency,
-        receipt: `${userId}_${planType}_${Date.now()}`,
+        receipt: razorpayReceipt(userId, planType),
         notes: { userId, planType },
       });
 
