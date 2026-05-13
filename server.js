@@ -11,8 +11,16 @@ const admin = require("firebase-admin");
 // -------------------- CONFIG --------------------
 
 const VALID_PLANS = {
-  weekly: { durationDays: 7, amount: 2.99, currency: "GBP" },
-  monthly: { durationDays: 30, amount: 8.99, currency: "GBP" },
+  weekly: {
+    durationDays: 7,
+    amount: 2.99,
+    currency: (process.env.RAZORPAY_ORDER_CURRENCY || "GBP").trim().toUpperCase(),
+  },
+  monthly: {
+    durationDays: 30,
+    amount: 8.99,
+    currency: (process.env.RAZORPAY_ORDER_CURRENCY || "GBP").trim().toUpperCase(),
+  },
 };
 
 // -------------------- FIREBASE ADMIN --------------------
@@ -124,21 +132,86 @@ function validatePaymentRequest(authUid, userId, planType, amount) {
   return { plan, numAmount };
 }
 
-function sendError(res, err) {
-  const status =
-    err.code === "unauthenticated"
-      ? 401
-      : err.code === "invalid-argument"
-      ? 400
-      : err.code === "already-exists"
-      ? 409
-      : err.code === "failed-precondition"
-      ? 503
-      : 500;
+const DOMAIN_ERROR_CODES = new Set([
+  "unauthenticated",
+  "invalid-argument",
+  "already-exists",
+  "failed-precondition",
+  "internal",
+]);
 
-  return res.status(status).json({
+/**
+ * Normalize app errors and Razorpay SDK errors (`{ statusCode, error: { description, code } }`).
+ */
+function normalizeApiError(err) {
+  if (!err) {
+    return {
+      code: "internal",
+      message: "Unknown error",
+      status: 500,
+    };
+  }
+
+  if (
+    typeof err.code === "string" &&
+    DOMAIN_ERROR_CODES.has(err.code) &&
+    typeof err.message === "string"
+  ) {
+    const status =
+      err.code === "unauthenticated"
+        ? 401
+        : err.code === "invalid-argument"
+        ? 400
+        : err.code === "already-exists"
+        ? 409
+        : err.code === "failed-precondition"
+        ? 503
+        : 500;
+    return { code: err.code, message: err.message, status };
+  }
+
+  const rpDesc =
+    err.error?.description ||
+    err.error?.reason ||
+    (typeof err.error === "string" ? err.error : "");
+  const http =
+    typeof err.statusCode === "number" ? err.statusCode : undefined;
+  const message =
+    rpDesc ||
+    err.message ||
+    (typeof err === "string" ? err : "") ||
+    "Payment provider error";
+
+  if (http === 401) {
+    return {
+      code: "unauthenticated",
+      message:
+        message ||
+        "Razorpay rejected credentials — check RAZORPAY_KEY_ID and RAZORPAY_SECRET on Railway.",
+      status: 401,
+    };
+  }
+
+  if (http !== undefined && http >= 400 && http < 500) {
+    return {
+      code: err.error?.code || "invalid-argument",
+      message,
+      status: http,
+    };
+  }
+
+  return { code: "internal", message, status: http && http >= 500 ? http : 500 };
+}
+
+function sendError(res, err) {
+  const n = normalizeApiError(err);
+  console.error("[payment-api]", n.status, n.code, n.message, err);
+  return res.status(n.status).json({
     success: false,
-    error: err.message || "Server error",
+    error: {
+      code: n.code,
+      message: n.message,
+    },
   });
 }
 
