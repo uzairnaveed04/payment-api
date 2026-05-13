@@ -266,15 +266,18 @@ function validatePaymentRequest(authUid, userId, planType, amountFromClient) {
     throw { code: "unauthenticated", message: "Login required" };
   }
 
-  if (planType == null || planType === "") {
+  const planKey =
+    typeof planType === "string" ? planType.trim() : planType;
+
+  if (planKey == null || planKey === "") {
     throw { code: "invalid-argument", message: "Missing plan type" };
   }
 
-  if (!VALID_PLANS[planType]) {
+  if (!VALID_PLANS[planKey]) {
     throw { code: "invalid-argument", message: "Invalid plan type" };
   }
 
-  const plan = VALID_PLANS[planType];
+  const plan = VALID_PLANS[planKey];
   const amountMinor = plan.amountMinor;
   const amountMajor = amountMinor / 100;
 
@@ -537,6 +540,24 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * Confirms deployed build (Railway). Old deploys had no route here.
+ * New API errors are always `{ success:false, error:{ code, message } }` — never `error: "string"`.
+ */
+app.get("/version", (_req, res) => {
+  res.json({
+    name: "payment-api",
+    apiPricingVersion: 2,
+    serverSidePricingOnly: true,
+    orderCurrencyDefault: ORDER_CURRENCY,
+    plans: Object.keys(VALID_PLANS).map((id) => ({
+      id,
+      amountMinor: VALID_PLANS[id].amountMinor,
+      currency: VALID_PLANS[id].currency,
+    })),
+  });
+});
+
 // CREATE ORDER
 app.post(
   "/api/payments/create-order",
@@ -544,7 +565,10 @@ app.post(
   authenticateFirebase,
   async (req, res) => {
     try {
-      const { userId, planType, amount } = req.body;
+      const { userId, amount } = req.body;
+      const rawPlan = req.body?.planType;
+      const planType =
+        typeof rawPlan === "string" ? rawPlan.trim() : rawPlan;
 
       console.log("[payment-api] create-order body:", {
         planType,
@@ -611,9 +635,11 @@ app.post(
         razorpay_payment_id,
         razorpay_signature,
         userId,
-        planType,
         amount,
       } = req.body;
+      const rawPlan = req.body?.planType;
+      const planType =
+        typeof rawPlan === "string" ? rawPlan.trim() : rawPlan;
 
       if (
         !razorpay_order_id ||
