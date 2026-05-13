@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
+const util = require("util");
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -10,25 +11,78 @@ const admin = require("firebase-admin");
 
 // -------------------- CONFIG --------------------
 
+/** Default INR — typical Razorpay dashboard accounts; UK/EU uses GBP via RAZORPAY_ORDER_CURRENCY=GBP */
+const ORDER_CURRENCY = (
+  process.env.RAZORPAY_ORDER_CURRENCY || "INR"
+).trim().toUpperCase();
+
 const VALID_PLANS = {
   weekly: {
     durationDays: 7,
     amount: 2.99,
-    currency: (process.env.RAZORPAY_ORDER_CURRENCY || "GBP").trim().toUpperCase(),
+    currency: ORDER_CURRENCY,
   },
   monthly: {
     durationDays: 30,
     amount: 8.99,
-    currency: (process.env.RAZORPAY_ORDER_CURRENCY || "GBP").trim().toUpperCase(),
+    currency: ORDER_CURRENCY,
   },
 };
 
 // -------------------- FIREBASE ADMIN --------------------
 
 /**
+ * PEM in JSON copied into Railway often keeps literal "\\n" sequences — Firebase requires real newlines.
+ */
+function normalizePrivateKeyInServiceAccount(serviceAccount) {
+  if (
+    !serviceAccount ||
+    typeof serviceAccount.private_key !== "string"
+  ) {
+    return;
+  }
+  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+}
+
+/**
+ * Parse service account JSON from env: strip BOM, optional base64 wrapper (some dashboards encode JSON).
+ */
+function parseServiceAccountFromEnv(raw) {
+  const trimmed = String(raw).replace(/^\uFEFF/, "").trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch (firstErr) {
+    if (trimmed.startsWith("{")) throw firstErr;
+    try {
+      const decoded = Buffer.from(trimmed, "base64").toString("utf8");
+      return JSON.parse(decoded);
+    } catch {
+      throw firstErr;
+    }
+  }
+}
+
+function credentialFromSplitEnv() {
+  const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
+  let privateKey = process.env.FIREBASE_PRIVATE_KEY?.trim();
+  if (!projectId || !clientEmail || !privateKey) return null;
+  privateKey = privateKey.replace(/\\n/g, "\n");
+  return {
+    project_id: projectId,
+    client_email: clientEmail,
+    private_key: privateKey,
+  };
+}
+
+/**
  * Initialize Firebase Admin once. Does not throw — returns false if credentials missing/invalid.
- * Railway: set FIREBASE_SERVICE_ACCOUNT_JSON (single-line JSON).
- * Local dev: same, OR download service account JSON and set GOOGLE_APPLICATION_CREDENTIALS to the file path.
+ *
+ * Priority:
+ * 1) FIREBASE_SERVICE_ACCOUNT_JSON — full service account JSON (recommended on Railway).
+ * 2) GOOGLE_APPLICATION_CREDENTIALS — path to the downloaded JSON file (local dev).
+ * 3) FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY — optional fallback only if JSON unset.
  */
 function initFirebaseAdmin() {
   if (admin.apps.length > 0) return true;
@@ -36,14 +90,18 @@ function initFirebaseAdmin() {
   const rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
   if (rawEnv) {
     try {
-      const serviceAccount = JSON.parse(rawEnv);
+      const serviceAccount = parseServiceAccountFromEnv(rawEnv);
+      normalizePrivateKeyInServiceAccount(serviceAccount);
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
       });
+      console.log(
+        "[payment-api] Firebase Admin initialized from FIREBASE_SERVICE_ACCOUNT_JSON"
+      );
       return true;
     } catch (e) {
       console.error(
-        "[payment-api] FIREBASE_SERVICE_ACCOUNT_JSON is invalid JSON:",
+        "[payment-api] FIREBASE_SERVICE_ACCOUNT_JSON could not be parsed:",
         e.message
       );
       return false;
@@ -64,13 +122,36 @@ function initFirebaseAdmin() {
         return false;
       }
       const serviceAccount = JSON.parse(fs.readFileSync(resolved, "utf8"));
+      normalizePrivateKeyInServiceAccount(serviceAccount);
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
       });
+      console.log(
+        "[payment-api] Firebase Admin initialized from GOOGLE_APPLICATION_CREDENTIALS"
+      );
       return true;
     } catch (e) {
       console.error(
         "[payment-api] Failed to load GOOGLE_APPLICATION_CREDENTIALS:",
+        e.message
+      );
+      return false;
+    }
+  }
+
+  const split = credentialFromSplitEnv();
+  if (split) {
+    try {
+      admin.initializeApp({
+        credential: admin.credential.cert(split),
+      });
+      console.log(
+        "[payment-api] Firebase Admin initialized from FIREBASE_PROJECT_ID / CLIENT_EMAIL / PRIVATE_KEY"
+      );
+      return true;
+    } catch (e) {
+      console.error(
+        "[payment-api] Split Firebase env vars failed to initialize:",
         e.message
       );
       return false;
@@ -84,8 +165,11 @@ function ensureFirebaseAdmin(req, res, next) {
   if (!initFirebaseAdmin()) {
     return res.status(503).json({
       success: false,
-      error:
-        "Firebase Admin not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON (Railway) or GOOGLE_APPLICATION_CREDENTIALS path to your service account JSON file (.env). See .env.example.",
+      error: {
+        code: "failed-precondition",
+        message:
+          "Firebase Admin not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON (Railway, single-line JSON) or GOOGLE_APPLICATION_CREDENTIALS (local file path). See backend/.env.example.",
+      },
     });
   }
   next();
@@ -140,6 +224,42 @@ const DOMAIN_ERROR_CODES = new Set([
   "internal",
 ]);
 
+function isPlainDomainError(err) {
+  return (
+    err &&
+    typeof err === "object" &&
+    typeof err.code === "string" &&
+    DOMAIN_ERROR_CODES.has(err.code) &&
+    typeof err.message === "string" &&
+    err.statusCode === undefined &&
+    err.response === undefined &&
+    err.error === undefined
+  );
+}
+
+/** Razorpay SDK uses `{ statusCode, error }`; axios leaks `{ response: { status, data } }` in some failures */
+function extractProviderMessage(err) {
+  const rpDesc =
+    err?.error?.description ||
+    err?.error?.reason ||
+    (typeof err?.error === "string" ? err.error : "");
+
+  const ax = err?.response?.data;
+  let axiosPart = "";
+  if (ax && typeof ax === "object") {
+    axiosPart =
+      ax.error?.description ||
+      ax.error?.reason ||
+      (typeof ax.error === "string" ? ax.error : "") ||
+      ax.message ||
+      "";
+  } else if (typeof ax === "string") {
+    axiosPart = ax;
+  }
+
+  return rpDesc || axiosPart || "";
+}
+
 /**
  * Normalize app errors and Razorpay SDK errors (`{ statusCode, error: { description, code } }`).
  */
@@ -170,15 +290,17 @@ function normalizeApiError(err) {
     return { code: err.code, message: err.message, status };
   }
 
-  const rpDesc =
-    err.error?.description ||
-    err.error?.reason ||
-    (typeof err.error === "string" ? err.error : "");
+  const providerMsg = extractProviderMessage(err);
   const http =
-    typeof err.statusCode === "number" ? err.statusCode : undefined;
+    typeof err.statusCode === "number"
+      ? err.statusCode
+      : typeof err.response?.status === "number"
+      ? err.response.status
+      : undefined;
+
   const message =
-    rpDesc ||
-    err.message ||
+    providerMsg ||
+    (typeof err.message === "string" ? err.message : "") ||
     (typeof err === "string" ? err : "") ||
     "Payment provider error";
 
@@ -194,7 +316,7 @@ function normalizeApiError(err) {
 
   if (http !== undefined && http >= 400 && http < 500) {
     return {
-      code: err.error?.code || "invalid-argument",
+      code: err.error?.code || err.response?.data?.error?.code || "invalid-argument",
       message,
       status: http,
     };
@@ -203,9 +325,22 @@ function normalizeApiError(err) {
   return { code: "internal", message, status: http && http >= 500 ? http : 500 };
 }
 
-function sendError(res, err) {
+function sendError(res, err, opts = {}) {
+  const route = opts.route || "";
+  if (!isPlainDomainError(err)) {
+    console.error(
+      `[payment-api] Raw error${route ? ` @ ${route}` : ""}:`,
+      util.inspect(err, { depth: 12, maxArrayLength: 40, breakLength: 100 })
+    );
+  }
+
   const n = normalizeApiError(err);
-  console.error("[payment-api]", n.status, n.code, n.message, err);
+  console.error(
+    `[payment-api] Response${route ? ` @ ${route}` : ""}`,
+    n.status,
+    n.code,
+    n.message
+  );
   return res.status(n.status).json({
     success: false,
     error: {
@@ -269,8 +404,9 @@ app.post(
 
       if (!creds) {
         throw {
-          code: "internal",
-          message: "Missing Razorpay credentials",
+          code: "failed-precondition",
+          message:
+            "Razorpay is not configured on the server: set RAZORPAY_KEY_ID and RAZORPAY_SECRET (or RAZORPAY_KEY_SECRET).",
         };
       }
 
@@ -279,8 +415,15 @@ app.post(
         key_secret: creds.secret,
       });
 
+      const amountMinor = Math.round(numAmount * 100);
+      console.log("[payment-api] Razorpay orders.create", {
+        planType,
+        currency: plan.currency,
+        amountMinorUnits: amountMinor,
+      });
+
       const order = await razorpay.orders.create({
-        amount: Math.round(numAmount * 100),
+        amount: amountMinor,
         currency: plan.currency,
         receipt: `${userId}_${planType}_${Date.now()}`,
         notes: { userId, planType },
@@ -293,7 +436,7 @@ app.post(
         currency: order.currency,
       });
     } catch (err) {
-      return sendError(res, err);
+      return sendError(res, err, { route: "POST /api/payments/create-order" });
     }
   }
 );
@@ -350,8 +493,9 @@ app.post(
       const creds = getRazorpayCredentials();
       if (!creds) {
         throw {
-          code: "internal",
-          message: "Missing Razorpay credentials",
+          code: "failed-precondition",
+          message:
+            "Razorpay is not configured on the server: set RAZORPAY_KEY_ID and RAZORPAY_SECRET (or RAZORPAY_KEY_SECRET).",
         };
       }
 
@@ -388,7 +532,7 @@ app.post(
         subscriptionId: doc.id,
       });
     } catch (err) {
-      return sendError(res, err);
+      return sendError(res, err, { route: "POST /api/payments/verify" });
     }
   }
 );
@@ -403,6 +547,19 @@ app.use((req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
+  const rz = getRazorpayCredentials();
+  console.log("[payment-api] Order currency:", ORDER_CURRENCY);
+  if (rz) {
+    const masked =
+      rz.keyId.length > 8
+        ? `${rz.keyId.slice(0, 6)}…${rz.keyId.slice(-4)}`
+        : "(short key)";
+    console.log("[payment-api] Razorpay env: key_id present", masked);
+  } else {
+    console.warn(
+      "[payment-api] Razorpay env MISSING — set RAZORPAY_KEY_ID and RAZORPAY_SECRET (create-order / verify will return 503)."
+    );
+  }
   if (!initFirebaseAdmin()) {
     console.warn(
       "[payment-api] Firebase Admin not configured — /health still works; payment routes return 503 until you set FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS."
