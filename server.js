@@ -22,12 +22,13 @@ const ORDER_CURRENCY = (
 const VALID_PLANS = {
   weekly: {
     durationDays: 7,
-    amount: 2.99,
+    /** Razorpay smallest currency unit (paise / pence): 2.99 → 299 */
+    amountMinor: 299,
     currency: ORDER_CURRENCY,
   },
   monthly: {
     durationDays: 30,
-    amount: 8.99,
+    amountMinor: 899,
     currency: ORDER_CURRENCY,
   },
 };
@@ -256,9 +257,17 @@ const getRazorpayCredentials = () => {
 
 // -------------------- HELPERS --------------------
 
-function validatePaymentRequest(authUid, userId, planType, amount) {
+/**
+ * Validates Firebase user + plan. Pricing comes only from VALID_PLANS (never trust client `amount`).
+ * Optional client `amount` is logged if it looks wrong — major (2.99) or minor (299) both tolerated for logging only.
+ */
+function validatePaymentRequest(authUid, userId, planType, amountFromClient) {
   if (!authUid || authUid !== userId) {
     throw { code: "unauthenticated", message: "Login required" };
+  }
+
+  if (planType == null || planType === "") {
+    throw { code: "invalid-argument", message: "Missing plan type" };
   }
 
   if (!VALID_PLANS[planType]) {
@@ -266,13 +275,38 @@ function validatePaymentRequest(authUid, userId, planType, amount) {
   }
 
   const plan = VALID_PLANS[planType];
-  const numAmount = Number(amount);
+  const amountMinor = plan.amountMinor;
+  const amountMajor = amountMinor / 100;
 
-  if (numAmount !== plan.amount) {
-    throw { code: "invalid-argument", message: "Invalid amount" };
+  if (
+    amountFromClient !== undefined &&
+    amountFromClient !== null &&
+    amountFromClient !== ""
+  ) {
+    const clientNum = Number(amountFromClient);
+    if (!Number.isFinite(clientNum)) {
+      console.warn(
+        "[payment-api] Client amount is not numeric (ignored for pricing):",
+        amountFromClient
+      );
+    } else {
+      const matchesMajor = clientNum === amountMajor;
+      const matchesMinor = clientNum === amountMinor;
+      if (!matchesMajor && !matchesMinor) {
+        console.warn(
+          "[payment-api] Client amount ignored — server uses plan price only. Got:",
+          amountFromClient,
+          "(major:",
+          amountMajor,
+          "minor:",
+          amountMinor,
+          ")"
+        );
+      }
+    }
   }
 
-  return { plan, numAmount };
+  return { plan, amountMinor, amountMajor };
 }
 
 const DOMAIN_ERROR_CODES = new Set([
@@ -512,7 +546,13 @@ app.post(
     try {
       const { userId, planType, amount } = req.body;
 
-      const { plan, numAmount } = validatePaymentRequest(
+      console.log("[payment-api] create-order body:", {
+        planType,
+        amount,
+        typeofAmount: typeof amount,
+      });
+
+      const { plan, amountMinor } = validatePaymentRequest(
         req.authUid,
         userId,
         planType,
@@ -534,7 +574,6 @@ app.post(
         key_secret: creds.secret,
       });
 
-      const amountMinor = Math.round(numAmount * 100);
       console.log("[payment-api] Razorpay orders.create", {
         planType,
         currency: plan.currency,
@@ -587,7 +626,7 @@ app.post(
         };
       }
 
-      const { plan, numAmount } = validatePaymentRequest(
+      const { plan, amountMajor } = validatePaymentRequest(
         req.authUid,
         userId,
         planType,
@@ -638,7 +677,7 @@ app.post(
         paymentId: razorpay_payment_id,
         orderId: razorpay_order_id,
         planType,
-        amount: numAmount,
+        amount: amountMajor,
         status: "active",
         verified: true,
         platform: "razorpay",
