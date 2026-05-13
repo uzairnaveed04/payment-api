@@ -556,7 +556,7 @@ app.get("/health", (req, res) => {
 app.get("/version", (_req, res) => {
   res.json({
     name: "payment-api",
-    apiPricingVersion: 3,
+    apiPricingVersion: 3.1,
     receiptStrategy: "randomHex32",
     serverSidePricingOnly: true,
     orderCurrencyDefault: ORDER_CURRENCY,
@@ -759,4 +759,5 @@ app.listen(PORT, "0.0.0.0", () => {
       "[payment-api] Firebase Admin not configured — /health still works; payment routes return 503 until you set FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS."
     );
   }
+  // Update Timestamp: 2026-05-13
 });
