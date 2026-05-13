@@ -255,10 +255,13 @@ const getRazorpayCredentials = () => {
   return { keyId, secret };
 };
 
-/** Razorpay receipt max length is 40 — Firebase uid + plan + timestamp exceeds that. */
-function razorpayReceipt(userId, planType) {
-  const raw = `${userId}|${planType}|${Date.now()}|${crypto.randomBytes(8).toString("hex")}`;
-  return crypto.createHash("sha256").update(raw).digest("hex").slice(0, 40);
+/**
+ * Razorpay: receipt max 40 chars, alphanumeric recommended.
+ * Never embed full Firebase uid + timestamp in receipt (exceeds limit).
+ * Correlation stays in `notes: { userId, planType }`.
+ */
+function razorpayReceipt() {
+  return crypto.randomBytes(16).toString("hex"); // 32 chars — under Razorpay 40 limit
 }
 
 // -------------------- HELPERS --------------------
@@ -553,7 +556,8 @@ app.get("/health", (req, res) => {
 app.get("/version", (_req, res) => {
   res.json({
     name: "payment-api",
-    apiPricingVersion: 2,
+    apiPricingVersion: 3,
+    receiptStrategy: "randomHex32",
     serverSidePricingOnly: true,
     orderCurrencyDefault: ORDER_CURRENCY,
     plans: Object.keys(VALID_PLANS).map((id) => ({
@@ -613,7 +617,7 @@ app.post(
       const order = await razorpay.orders.create({
         amount: amountMinor,
         currency: plan.currency,
-        receipt: razorpayReceipt(userId, planType),
+        receipt: razorpayReceipt(),
         notes: { userId, planType },
       });
 
