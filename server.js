@@ -9,6 +9,9 @@ const crypto = require("crypto");
 const Razorpay = require("razorpay");
 const admin = require("firebase-admin");
 
+/** Set when Firebase Admin initializes successfully — compared to JWT `iss` for diagnostics */
+let firebaseAdminProjectId = null;
+
 // -------------------- CONFIG --------------------
 
 /** Default INR — typical Razorpay dashboard accounts; UK/EU uses GBP via RAZORPAY_ORDER_CURRENCY=GBP */
@@ -31,6 +34,26 @@ const VALID_PLANS = {
 
 // -------------------- FIREBASE ADMIN --------------------
 
+/** Decode JWT payload without verifying (debug only). */
+function decodeJwtPayloadUnverified(token) {
+  try {
+    const parts = String(token).split(".");
+    if (parts.length < 2) return null;
+    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+    const json = Buffer.from(b64 + pad, "base64").toString("utf8");
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+function firebaseProjectIdFromIss(iss) {
+  if (!iss || typeof iss !== "string") return null;
+  const m = iss.match(/https:\/\/securetoken\.google\.com\/([^/]+)/);
+  return m ? m[1] : null;
+}
+
 /**
  * PEM in JSON copied into Railway often keeps literal "\\n" sequences — Firebase requires real newlines.
  */
@@ -41,14 +64,26 @@ function normalizePrivateKeyInServiceAccount(serviceAccount) {
   ) {
     return;
   }
-  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+  serviceAccount.private_key = serviceAccount.private_key
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n");
 }
 
 /**
- * Parse service account JSON from env: strip BOM, optional base64 wrapper (some dashboards encode JSON).
+ * Parse service account JSON from env: strip BOM, optional base64 wrapper,
+ * optional outer JSON-string wrapping (Railway / escape mistakes).
  */
 function parseServiceAccountFromEnv(raw) {
-  const trimmed = String(raw).replace(/^\uFEFF/, "").trim();
+  let trimmed = String(raw).replace(/^\uFEFF/, "").trim();
+  // Whole value is a JSON *string* containing stringified JSON
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const inner = JSON.parse(trimmed);
+      if (typeof inner === "string") trimmed = inner.trim();
+    } catch (_) {
+      /* keep trimmed */
+    }
+  }
   if (!trimmed) return null;
   try {
     return JSON.parse(trimmed);
@@ -81,27 +116,44 @@ function credentialFromSplitEnv() {
  *
  * Priority:
  * 1) FIREBASE_SERVICE_ACCOUNT_JSON — full service account JSON (recommended on Railway).
+ *    If this variable is non-empty but invalid JSON → FAIL (do not fall through to split-env).
  * 2) GOOGLE_APPLICATION_CREDENTIALS — path to the downloaded JSON file (local dev).
- * 3) FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY — optional fallback only if JSON unset.
+ * 3) FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY — only when JSON var is unset/empty.
  */
 function initFirebaseAdmin() {
   if (admin.apps.length > 0) return true;
 
-  const rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
-  if (rawEnv) {
+  const rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const trimmedEnv =
+    typeof rawEnv === "string" ? rawEnv.replace(/^\uFEFF/, "").trim() : "";
+
+  if (trimmedEnv.length > 0) {
     try {
-      const serviceAccount = parseServiceAccountFromEnv(rawEnv);
+      const serviceAccount = parseServiceAccountFromEnv(trimmedEnv);
       normalizePrivateKeyInServiceAccount(serviceAccount);
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
       });
+      firebaseAdminProjectId = serviceAccount.project_id || null;
       console.log(
-        "[payment-api] Firebase Admin initialized from FIREBASE_SERVICE_ACCOUNT_JSON"
+        "[payment-api] Firebase Admin OK via FIREBASE_SERVICE_ACCOUNT_JSON project_id=",
+        firebaseAdminProjectId,
+        "client_email=",
+        serviceAccount.client_email
       );
+      const expect = process.env.FIREBASE_EXPECT_PROJECT_ID?.trim();
+      if (expect && firebaseAdminProjectId && expect !== firebaseAdminProjectId) {
+        console.error(
+          "[payment-api] FIREBASE_EXPECT_PROJECT_ID mismatch: env expects",
+          expect,
+          "but JSON has",
+          firebaseAdminProjectId
+        );
+      }
       return true;
     } catch (e) {
       console.error(
-        "[payment-api] FIREBASE_SERVICE_ACCOUNT_JSON could not be parsed:",
+        "[payment-api] FIREBASE_SERVICE_ACCOUNT_JSON invalid (fix Railway JSON; split-env will NOT be tried):",
         e.message
       );
       return false;
@@ -126,8 +178,10 @@ function initFirebaseAdmin() {
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
       });
+      firebaseAdminProjectId = serviceAccount.project_id || null;
       console.log(
-        "[payment-api] Firebase Admin initialized from GOOGLE_APPLICATION_CREDENTIALS"
+        "[payment-api] Firebase Admin OK via GOOGLE_APPLICATION_CREDENTIALS project_id=",
+        firebaseAdminProjectId
       );
       return true;
     } catch (e) {
@@ -145,14 +199,19 @@ function initFirebaseAdmin() {
       admin.initializeApp({
         credential: admin.credential.cert(split),
       });
+      firebaseAdminProjectId = split.project_id || null;
       console.log(
-        "[payment-api] Firebase Admin initialized from FIREBASE_PROJECT_ID / CLIENT_EMAIL / PRIVATE_KEY"
+        "[payment-api] Firebase Admin OK via split env project_id=",
+        firebaseAdminProjectId
       );
       return true;
     } catch (e) {
       console.error(
         "[payment-api] Split Firebase env vars failed to initialize:",
         e.message
+      );
+      console.error(
+        "[payment-api] Hint: Prefer FIREBASE_SERVICE_ACCOUNT_JSON on Railway; remove broken FIREBASE_PRIVATE_KEY split vars."
       );
       return false;
     }
@@ -352,18 +411,67 @@ function sendError(res, err, opts = {}) {
 
 // -------------------- AUTH --------------------
 
+function tokenVerifyClientMessage(err) {
+  const c = err?.errorInfo?.code || err?.code;
+  if (c === "auth/id-token-expired") return "Token expired — please sign in again.";
+  if (c === "auth/id-token-revoked") return "Session revoked — please sign in again.";
+  if (c === "auth/user-disabled") return "Account disabled.";
+  if (c === "auth/argument-error") return "Malformed token.";
+  return "Invalid token";
+}
+
 async function authenticateFirebase(req, res, next) {
   try {
     const header = req.headers.authorization || "";
     const token = header.startsWith("Bearer ")
-      ? header.split("Bearer ")[1]
+      ? header.slice("Bearer ".length).trim()
       : null;
 
     if (!token) {
-      return sendError(res, {
-        code: "unauthenticated",
-        message: "Missing token",
+      return sendError(
+        res,
+        {
+          code: "unauthenticated",
+          message: "Missing token",
+        },
+        { route: "authenticateFirebase" }
+      );
+    }
+
+    const preview =
+      token.length >= 20 ? `${token.slice(0, 20)}…` : `${token.slice(0, 8)}…`;
+    const payload = decodeJwtPayloadUnverified(token);
+
+    if (payload) {
+      const projFromToken = firebaseProjectIdFromIss(payload.iss);
+      console.log("[payment-api] Bearer preview:", preview);
+      console.log("[payment-api] JWT claims (unverified)", {
+        iss: payload.iss,
+        aud: payload.aud,
+        projectFromIss: projFromToken,
+        subPreview:
+          typeof payload.sub === "string"
+            ? `${payload.sub.slice(0, 14)}…`
+            : payload.sub,
       });
+
+      if (
+        firebaseAdminProjectId &&
+        projFromToken &&
+        projFromToken !== firebaseAdminProjectId
+      ) {
+        console.error(
+          "[payment-api] TOKEN vs ADMIN PROJECT MISMATCH — token project:",
+          projFromToken,
+          "Firebase Admin project_id:",
+          firebaseAdminProjectId,
+          "| Fix: use service account JSON from the SAME Firebase project that issued this idToken (routingapp-4bcb4)."
+        );
+      }
+    } else {
+      console.warn(
+        "[payment-api] Bearer present but JWT payload could not be decoded (truncated or not a JWT)."
+      );
     }
 
     const decoded = await admin.auth().verifyIdToken(token);
@@ -371,10 +479,21 @@ async function authenticateFirebase(req, res, next) {
 
     next();
   } catch (err) {
-    return sendError(res, {
-      code: "unauthenticated",
-      message: "Invalid token",
-    });
+    const fbCode = err?.errorInfo?.code || err?.code;
+    console.error(
+      "[payment-api] verifyIdToken FAILED:",
+      fbCode || err?.name,
+      err?.message
+    );
+
+    return sendError(
+      res,
+      {
+        code: "unauthenticated",
+        message: tokenVerifyClientMessage(err),
+      },
+      { route: "authenticateFirebase" }
+    );
   }
 }
 

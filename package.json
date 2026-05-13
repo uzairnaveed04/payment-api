@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test:razorpay": "node scripts/verify-razorpay.js"
+    "test:razorpay": "node scripts/verify-razorpay.js",
+    "test:create-order": "node scripts/local-payment-flow-test.js"
   },
   "engines": {
     "node": ">=18"

@@ -5,6 +5,7 @@
 
 require("dotenv").config({ path: require("path").join(__dirname, "..", ".env") });
 
+const util = require("util");
 const Razorpay = require("razorpay");
 
 const keyId = process.env.RAZORPAY_KEY_ID?.trim();
@@ -28,10 +29,11 @@ async function main() {
 
   const razorpay = new Razorpay({ key_id: keyId, key_secret: secret });
 
-  // Same as server.js weekly plan (GBP). Some Razorpay accounts only support INR in test mode.
+  // Matches server.js weekly plan (default currency INR). Fallback GBP for international accounts.
   const attempts = [
-    { amount: Math.round(2.99 * 100), currency: "GBP", label: "GBP weekly (matches server)" },
-    { amount: 100, currency: "INR", label: "INR ₹1 fallback (regional test accounts)" },
+    { amount: Math.round(2.99 * 100), currency: "INR", label: "INR weekly (matches server default)" },
+    { amount: Math.round(2.99 * 100), currency: "GBP", label: "GBP weekly (if RAZORPAY_ORDER_CURRENCY=GBP)" },
+    { amount: 100, currency: "INR", label: "INR ₹1 minimal fallback" },
   ];
 
   let lastErr;
@@ -56,13 +58,10 @@ async function main() {
       console.log("   Order id:", order.id);
       console.log("   Amount (minor units):", order.amount, order.currency);
       console.log("   Key ID prefix:", keyId.slice(0, 12) + "...");
-      if (currency !== "GBP") {
+      if (currency !== "INR") {
         console.log("");
         console.log(
-          "Note: GBP order failed but INR worked — account may be India-only in test mode."
-        );
-        console.log(
-          "Your app server uses GBP for plans; enable international / GBP on Razorpay or use an account that supports GBP."
+          "Note: INR default failed but another currency worked — check RAZORPAY_ORDER_CURRENCY matches your Razorpay account."
         );
       }
       process.exit(0);
@@ -70,9 +69,17 @@ async function main() {
       lastErr = err;
       const desc =
         err?.error?.description ||
+        err?.error?.reason ||
         err?.message ||
-        JSON.stringify(err?.error || err);
+        util.inspect(err?.error ?? err, { depth: 6, breakLength: 120 })
+          .split("\n")[0];
       console.log("   ->", desc.split("\n")[0]);
+      if (!err?.error?.description && err?.statusCode) {
+        console.log(
+          "      full:",
+          util.inspect(err, { depth: 8, breakLength: 120 })
+        );
+      }
     }
   }
 
