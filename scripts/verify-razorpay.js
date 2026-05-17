@@ -29,11 +29,10 @@ async function main() {
 
   const razorpay = new Razorpay({ key_id: keyId, key_secret: secret });
 
-  // Matches server.js weekly plan (default currency INR). Fallback GBP for international accounts.
+  // Matches server.js: GBP only — weekly £2.99 / monthly £8.99 (minor units = pence)
   const attempts = [
-    { amount: Math.round(2.99 * 100), currency: "INR", label: "INR weekly (matches server default)" },
-    { amount: Math.round(2.99 * 100), currency: "GBP", label: "GBP weekly (if RAZORPAY_ORDER_CURRENCY=GBP)" },
-    { amount: 100, currency: "INR", label: "INR ₹1 minimal fallback" },
+    { amount: Math.round(2.99 * 100), currency: "GBP", label: "GBP weekly (£2.99)" },
+    { amount: Math.round(8.99 * 100), currency: "GBP", label: "GBP monthly (£8.99)" },
   ];
 
   let lastErr;
@@ -58,12 +57,10 @@ async function main() {
       console.log("   Order id:", order.id);
       console.log("   Amount (minor units):", order.amount, order.currency);
       console.log("   Key ID prefix:", keyId.slice(0, 12) + "...");
-      if (currency !== "INR") {
-        console.log("");
-        console.log(
-          "Note: INR default failed but another currency worked — check RAZORPAY_ORDER_CURRENCY matches your Razorpay account."
-        );
-      }
+      console.log("");
+      console.log(
+        "Ensure your Razorpay account supports GBP — the live app only creates GBP orders (UK £)."
+      );
       process.exit(0);
     } catch (err) {
       lastErr = err;
@@ -84,7 +81,7 @@ async function main() {
   }
 
   console.error("");
-  console.error("FAILED — Razorpay rejected all attempts:");
+  console.error("FAILED — Razorpay rejected all GBP attempts:");
   const desc =
     lastErr?.error?.description ||
     lastErr?.message ||
@@ -92,7 +89,9 @@ async function main() {
   console.error(" ", desc);
   if (lastErr?.statusCode) console.error("   HTTP status:", lastErr.statusCode);
   console.error("");
-  console.error("Check: Key ID matches Dashboard test keys, secret is current, no extra spaces in .env.");
+  console.error(
+    "Check: Key ID matches Dashboard, secret is current, and GBP international payments are enabled for your Razorpay account."
+  );
   process.exit(1);
 }
 

@@ -201,7 +201,8 @@ exports.verifyRazorpayPayment = functions.https.onCall(function (request) { retu
                     amount: numAmount,
                     createdAt: now,
                     expiryDate: expiryDate,
-                    platform: "razorpay"
+                    platform: "razorpay",
+                    autoRenew: false
                 };
                 return [4 /*yield*/, db.collection("subscriptions").add(subscriptionData)];
             case 2:

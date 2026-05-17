@@ -25,8 +25,8 @@ async function run() {
 
   const razorpay = new Razorpay({ key_id: keyId, key_secret: secret });
   const attempts = [
-    { amount: Math.round(2.99 * 100), currency: "GBP", label: "gbp" },
-    { amount: 100, currency: "INR", label: "inr_fallback" },
+    { amount: Math.round(2.99 * 100), currency: "GBP", label: "gbp_weekly" },
+    { amount: Math.round(8.99 * 100), currency: "GBP", label: "gbp_monthly" },
   ];
 
   for (const { amount, currency, label } of attempts) {

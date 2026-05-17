@@ -1,8 +1,94 @@
 import * as functions from "firebase-functions/v2";
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
+import { FieldValue } from "firebase-admin/firestore";
+import { defineSecret } from "firebase-functions/params";
 
 admin.initializeApp();
+
+const expoAccessToken = defineSecret("EXPO_ACCESS_TOKEN");
+
+type NotificationPrefCategory = "new_route" | "practice_reminder" | "app_update";
+
+function normalizePrefs(raw: unknown): Record<NotificationPrefCategory, boolean> {
+  const base: Record<NotificationPrefCategory, boolean> = {
+    new_route: true,
+    practice_reminder: true,
+    app_update: true,
+  };
+  if (!raw || typeof raw !== "object") return base;
+  const o = raw as Record<string, unknown>;
+  for (const k of Object.keys(base) as NotificationPrefCategory[]) {
+    if (typeof o[k] === "boolean") base[k] = o[k] as boolean;
+  }
+  return base;
+}
+
+function assertAuthenticated(request: functions.https.CallableRequest): string {
+  if (!request.auth?.uid) {
+    throw new functions.https.HttpsError(
+      "unauthenticated",
+      "Authentication required."
+    );
+  }
+  return request.auth.uid;
+}
+
+function assertValidExpoPushToken(token: unknown): string {
+  if (typeof token !== "string" || !/^ExponentPushToken\[[^\]]+\]$/.test(token.trim())) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Invalid Expo push token."
+    );
+  }
+  return token.trim();
+}
+
+async function postExpoPushMessage(opts: {
+  accessToken: string;
+  to: string;
+  title: string;
+  body: string;
+  data: Record<string, unknown>;
+}): Promise<{ ok: true } | { ok: false; detail: string }> {
+  const res = await fetch("https://exp.host/--/api/v2/push/send", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${opts.accessToken}`,
+    },
+    body: JSON.stringify({
+      to: opts.to,
+      title: opts.title,
+      body: opts.body,
+      data: opts.data,
+      sound: "default",
+      priority: "high",
+      channelId: "default",
+    }),
+  });
+
+  const json = (await res.json()) as {
+    errors?: { code?: string; message?: string }[];
+    data?: { status?: string; message?: string; id?: string }[];
+  };
+
+  if (!res.ok) {
+    const msg =
+      json.errors?.map((e) => e.message).filter(Boolean).join("; ") ||
+      `Expo Push HTTP ${res.status}`;
+    return { ok: false, detail: msg };
+  }
+
+  const ticket = json.data?.[0];
+  if (!ticket || ticket.status === "error") {
+    const msg = ticket?.message || json.errors?.[0]?.message || "Expo push ticket error";
+    return { ok: false, detail: msg };
+  }
+
+  return { ok: true };
+}
 
 /**
  * Razorpay credentials from environment (never commit real values).
@@ -31,9 +117,143 @@ const callableOptions = {
     "http://localhost:9090",
     "http://127.0.0.1:9090",
     "http://localhost:8081",
-    "http://127.0.0.1:8081"
+    "http://127.0.0.1:8081",
+    "https://localhost",
+    "https://localhost:8081"
   ]
 };
+
+/** Persist Expo token server-side so campaigns / tests can target this install. */
+export const registerPushDevice = functions.https.onCall(callableOptions, async (request) => {
+  try {
+    const uid = assertAuthenticated(request);
+    const expoPushToken = assertValidExpoPushToken(request.data?.expoPushToken);
+    const prefs = normalizePrefs(request.data?.prefs);
+    const platform =
+      typeof request.data?.platform === "string" && request.data.platform.length > 0
+        ? request.data.platform.slice(0, 32)
+        : "unknown";
+
+    await admin.firestore().collection("users").doc(uid).set(
+      {
+        expoPushToken,
+        notificationPrefs: prefs,
+        pushPlatform: platform,
+        pushRegisteredAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return { success: true };
+  } catch (error: unknown) {
+    if (error instanceof functions.https.HttpsError) throw error;
+    console.error("registerPushDevice error:", error);
+    throw new functions.https.HttpsError(
+      "internal",
+      "Could not register push device."
+    );
+  }
+});
+
+/**
+ * Sends one Expo push to the token saved on the user's profile (dev / QA).
+ * Requires Secret Manager: EXPO_ACCESS_TOKEN (Expo account token with push permission).
+ */
+export const sendTestPushNotification = functions.https.onCall(
+  {
+    ...callableOptions,
+    secrets: [expoAccessToken],
+  },
+  async (request) => {
+    try {
+      const uid = assertAuthenticated(request);
+      const rawType = request.data?.type;
+      const type: NotificationPrefCategory =
+        rawType === "new_route" || rawType === "practice_reminder" || rawType === "app_update"
+          ? rawType
+          : "app_update";
+
+      const snap = await admin.firestore().collection("users").doc(uid).get();
+      const token = snap.get("expoPushToken");
+      if (typeof token !== "string" || !/^ExponentPushToken\[[^\]]+\]$/.test(token.trim())) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "No Expo push token on file. Open the app once (notifications allowed), then try again."
+        );
+      }
+
+      const prefs = normalizePrefs(snap.get("notificationPrefs"));
+      if (prefs[type] === false) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          `Notifications for '${type}' are disabled in the app — enable them first.`
+        );
+      }
+
+      const accessToken = expoAccessToken.value()?.trim();
+      if (!accessToken) {
+        console.error("EXPO_ACCESS_TOKEN secret is empty");
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Server is missing Expo push credentials (EXPO_ACCESS_TOKEN)."
+        );
+      }
+
+      const notificationId = `test_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+      const createdAt = Date.now();
+
+      const copy: Record<NotificationPrefCategory, { title: string; body: string }> = {
+        new_route: {
+          title: "New route (test)",
+          body: "If you see this, server→Expo→FCM delivery is working.",
+        },
+        practice_reminder: {
+          title: "Practice reminder (test)",
+          body: "If you see this, server→Expo→FCM delivery is working.",
+        },
+        app_update: {
+          title: "App update (test)",
+          body: "If you see this, server→Expo→FCM delivery is working.",
+        },
+      };
+
+      const { title, body } = copy[type];
+      const result = await postExpoPushMessage({
+        accessToken,
+        to: token.trim(),
+        title,
+        body,
+        data: {
+          type,
+          notificationId,
+          createdAt,
+          read: false,
+        },
+      });
+
+      if (!result.ok) {
+        console.error("Expo push failed", result.detail);
+        throw new functions.https.HttpsError(
+          "internal",
+          `Expo Push API error: ${result.detail}`
+        );
+      }
+
+      return {
+        success: true,
+        message: "Test notification queued. Check the tray within a few seconds.",
+        notificationId,
+      };
+    } catch (error: unknown) {
+      if (error instanceof functions.https.HttpsError) throw error;
+      console.error("sendTestPushNotification error:", error);
+      throw new functions.https.HttpsError(
+        "internal",
+        "Could not send test notification."
+      );
+    }
+  }
+);
 
 const validatePaymentRequest = (
   request: functions.https.CallableRequest,
@@ -240,7 +460,8 @@ export const verifyRazorpayPayment = functions.https.onCall(callableOptions, asy
       amount: numAmount,
       createdAt: now,
       expiryDate,
-      platform: "razorpay"
+      platform: "razorpay",
+      autoRenew: false
     };
 
     const docRef = await db.collection("subscriptions").add(subscriptionData);

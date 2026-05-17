@@ -14,10 +14,11 @@ let firebaseAdminProjectId = null;
 
 // -------------------- CONFIG --------------------
 
-/** Default INR — typical Razorpay dashboard accounts; UK/EU uses GBP via RAZORPAY_ORDER_CURRENCY=GBP */
-const ORDER_CURRENCY = (
-  process.env.RAZORPAY_ORDER_CURRENCY || "INR"
-).trim().toUpperCase();
+/**
+ * UK product — Razorpay Orders API currency is always GBP (minor units = pence).
+ * Your Razorpay account must be enabled for GBP; the app UI only shows £.
+ */
+const ORDER_CURRENCY = "GBP";
 
 const VALID_PLANS = {
   weekly: {
@@ -717,6 +718,8 @@ app.post(
         status: "active",
         verified: true,
         platform: "razorpay",
+        /** One-off Razorpay checkout (no recurring mandate). Flip via admin when recurring billing exists. */
+        autoRenew: false,
         createdAt: now,
         expiryDate: expiry,
       });
