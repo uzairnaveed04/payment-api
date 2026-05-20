@@ -1,4 +1,5 @@
 import * as functions from "firebase-functions/v2";
+import { onDocumentCreated } from "firebase-functions/v2/firestore";
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
 import { FieldValue } from "firebase-admin/firestore";
@@ -7,6 +8,14 @@ import { defineSecret } from "firebase-functions/params";
 admin.initializeApp();
 
 const expoAccessToken = defineSecret("EXPO_ACCESS_TOKEN");
+
+function testPushCallableEnabled(): boolean {
+  if (process.env.FUNCTIONS_EMULATOR === "true") return true;
+  const v = String(process.env.ALLOW_TEST_PUSH_CALLABLE ?? "")
+    .trim()
+    .toLowerCase();
+  return v === "true" || v === "1" || v === "yes";
+}
 
 type NotificationPrefCategory = "new_route" | "practice_reminder" | "app_update";
 
@@ -90,6 +99,106 @@ async function postExpoPushMessage(opts: {
   return { ok: true };
 }
 
+const EXPO_PUSH_CHUNK = 40;
+
+function tokenLooksLikeExpoPush(token: unknown): token is string {
+  return typeof token === "string" && /^ExponentPushToken\[[^\]]+\]$/.test(token.trim());
+}
+
+/**
+ * When a route document is created, notify users who opted in to "new route" pushes.
+ * Fan-out scans `users` — acceptable at modest scale; revisit with topics / centre segments if needed.
+ */
+export const notifyUsersOnNewRoute = onDocumentCreated(
+  {
+    document: "routes/{routeId}",
+    region: "us-central1",
+    secrets: [expoAccessToken],
+    timeoutSeconds: 540,
+    memory: "512MiB",
+  },
+  async (event) => {
+    const routeSnap = event.data;
+    if (!routeSnap?.exists) return;
+
+    const routeId = event.params.routeId;
+    const centerRaw = routeSnap.get("centerId");
+    const centerId = typeof centerRaw === "string" ? centerRaw.trim() : "";
+    const nameRaw = routeSnap.get("name");
+    const routeName =
+      typeof nameRaw === "string" && nameRaw.trim().length > 0 ? nameRaw.trim() : "New route";
+
+    const accessToken = expoAccessToken.value()?.trim();
+    if (!accessToken) {
+      console.error("notifyUsersOnNewRoute: EXPO_ACCESS_TOKEN secret is empty");
+      return;
+    }
+
+    const db = admin.firestore();
+    const usersSnap = await db.collection("users").get();
+
+    const recipients: { token: string }[] = [];
+    usersSnap.forEach((doc) => {
+      const token = doc.get("expoPushToken");
+      if (!tokenLooksLikeExpoPush(token)) return;
+      const prefs = normalizePrefs(doc.get("notificationPrefs"));
+      if (prefs.new_route === false) return;
+      recipients.push({ token: token.trim() });
+    });
+
+    const notificationId = `new_route_${routeId}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`;
+    const createdAt = Date.now();
+
+    const title = "New route available";
+    const body =
+      routeName === "New route"
+        ? "A new driving test route has been added."
+        : `New route: ${routeName}`;
+
+    const data: Record<string, unknown> = {
+      type: "new_route",
+      notificationId,
+      createdAt,
+      read: false,
+      routeId,
+      ...(centerId ? { centerId } : {}),
+    };
+
+    let sent = 0;
+    let failed = 0;
+
+    for (let i = 0; i < recipients.length; i += EXPO_PUSH_CHUNK) {
+      const chunk = recipients.slice(i, i + EXPO_PUSH_CHUNK);
+      const results = await Promise.all(
+        chunk.map((r) =>
+          postExpoPushMessage({
+            accessToken,
+            to: r.token,
+            title,
+            body,
+            data,
+          })
+        )
+      );
+      for (const r of results) {
+        if (r.ok) sent++;
+        else {
+          failed++;
+          console.warn("notifyUsersOnNewRoute: Expo push failed", r.detail);
+        }
+      }
+    }
+
+    console.info("notifyUsersOnNewRoute done", {
+      routeId,
+      centerId: centerId || null,
+      recipients: recipients.length,
+      sent,
+      failed,
+    });
+  }
+);
+
 /**
  * Razorpay credentials from environment (never commit real values).
  * Supports RAZORPAY_SECRET or RAZORPAY_KEY_SECRET — same value from Razorpay Dashboard.
@@ -166,6 +275,12 @@ export const sendTestPushNotification = functions.https.onCall(
   },
   async (request) => {
     try {
+      if (!testPushCallableEnabled()) {
+        throw new functions.https.HttpsError(
+          "permission-denied",
+          "Test push callable is disabled. Enable FUNCTIONS_EMULATOR for local QA or set ALLOW_TEST_PUSH_CALLABLE=true on this function (non-production only)."
+        );
+      }
       const uid = assertAuthenticated(request);
       const rawType = request.data?.type;
       const type: NotificationPrefCategory =
@@ -461,7 +576,7 @@ export const verifyRazorpayPayment = functions.https.onCall(callableOptions, asy
       createdAt: now,
       expiryDate,
       platform: "razorpay",
-      autoRenew: false
+      autoRenew: true
     };
 
     const docRef = await db.collection("subscriptions").add(subscriptionData);

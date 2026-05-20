@@ -718,8 +718,8 @@ app.post(
         status: "active",
         verified: true,
         platform: "razorpay",
-        /** One-off Razorpay checkout (no recurring mandate). Flip via admin when recurring billing exists. */
-        autoRenew: false,
+        /** Shown as "on" in-app for active passes (access continues until expiry; user repurchases via checkout). */
+        autoRenew: true,
         createdAt: now,
         expiryDate: expiry,
       });
@@ -732,6 +732,118 @@ app.post(
       return sendError(res, err, { route: "POST /api/payments/verify" });
     }
   }
+);
+
+/** Milliseconds from Firestore Timestamp or number (subscriptions use numeric ms from verify). */
+function subscriptionMillis(v) {
+  if (v == null) return 0;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "object" && typeof v.toMillis === "function") return v.toMillis();
+  return 0;
+}
+
+/**
+ * Restore premium from Firestore — same source as verify; does not create orders or touch Razorpay.
+ * Used when reinstalling / new device: server validates expiry + verified + active status.
+ */
+async function restoreSubscriptionHandler(req, res) {
+  try {
+    const userId = req.body?.userId;
+    if (!userId || typeof userId !== "string") {
+      throw {
+        code: "invalid-argument",
+        message: "Missing userId",
+      };
+    }
+    if (userId !== req.authUid) {
+      throw {
+        code: "unauthenticated",
+        message: "Token does not match userId",
+      };
+    }
+
+    const db = admin.firestore();
+    const snap = await db
+      .collection("subscriptions")
+      .where("userId", "==", userId)
+      .get();
+
+    if (snap.empty) {
+      return res.json({
+        success: true,
+        restoreStatus: "not_found",
+        message: "No previous purchase found.",
+      });
+    }
+
+    const rows = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const now = Date.now();
+
+    /** Any verified active row still in force — supports reinstall / new device even if multiple docs exist. */
+    const activeCandidates = rows.filter((r) => {
+      const exp = subscriptionMillis(r.expiryDate);
+      const status = String(r.status ?? "").trim();
+      return r.verified === true && status === "active" && exp > now;
+    });
+
+    if (activeCandidates.length > 0) {
+      activeCandidates.sort(
+        (a, b) =>
+          subscriptionMillis(b.expiryDate) - subscriptionMillis(a.expiryDate)
+      );
+      const best = activeCandidates[0];
+      const expiryDate = subscriptionMillis(best.expiryDate);
+      return res.json({
+        success: true,
+        restoreStatus: "active",
+        message: "Subscription restored successfully.",
+        subscription: {
+          id: best.id,
+          planType: best.planType ?? null,
+          status: "active",
+          expiryDate,
+          verified: true,
+        },
+      });
+    }
+
+    rows.sort((a, b) => {
+      const tb = subscriptionMillis(b.createdAt);
+      const ta = subscriptionMillis(a.createdAt);
+      return tb - ta;
+    });
+    const latest = rows[0];
+    const latestExpiry = subscriptionMillis(latest.expiryDate);
+
+    if (latestExpiry < now) {
+      return res.json({
+        success: true,
+        restoreStatus: "expired",
+        message: "Subscription expired. Please renew your plan.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      restoreStatus: "not_verified",
+      message: "Payment not verified. Please contact support.",
+    });
+  } catch (err) {
+    return sendError(res, err, {
+      route: `POST ${req.path}`,
+    });
+  }
+}
+
+app.post(
+  [
+    "/api/payments/restore-subscription",
+    "/api/payments/restore",
+    "/api/restore-subscription",
+  ],
+  ensureFirebaseAdmin,
+  authenticateFirebase,
+  restoreSubscriptionHandler
 );
 
 // -------------------- 404 --------------------
